@@ -59,6 +59,17 @@ PONTO_CORTE_SAEB = 743
 
 
 
+DIM_REDE = {0: "Total", 1: "Federal", 2: "Estadual", 3: "Municipal", 4: "Privada", 5: "Publica"}
+
+
+def mapear_rede(coluna):
+    """Traduz o codigo da rede para o nome, como a Silver do lote faz."""
+    expressao = F.lit(None).cast("string")
+    for codigo, nome in DIM_REDE.items():
+        expressao = F.when(coluna == codigo, F.lit(nome)).otherwise(expressao)
+    return expressao
+
+
 TOTAL_EVENTOS = int(dbutils.widgets.get("total_eventos"))
 PCT_DEFEITUOSOS = 0.05
 MUNICIPIOS_SIMULADOS = 40
@@ -222,8 +233,11 @@ def motivo_rejeicao(df):
 
 
 def processar_lote(lote, epoca):
+    # Em modo ANSI, que e o padrao do Databricks, to_timestamp levanta excecao
+    # quando o valor esta malformado. O try_to_timestamp devolve NULL, que e o
+    # que a regra timestamp_invalido procura para mandar o evento a fila de erro.
     marcado = (lote
-               .withColumn("ts_convertido", F.to_timestamp("ts_evento"))
+               .withColumn("ts_convertido", F.expr("try_to_timestamp(ts_evento)"))
                .join(F.broadcast(dim_municipio), on="id_municipio", how="left"))
     marcado = marcado.withColumn("motivo_rejeicao", motivo_rejeicao(marcado))
 
@@ -240,6 +254,7 @@ def processar_lote(lote, epoca):
                .withColumn("alfabetizado",
                            F.col("proficiencia_portugues") >= F.lit(PONTO_CORTE_SAEB))
                .withColumn("peso_aluno", F.coalesce(F.col("peso_aluno"), F.lit(1.0)))
+               .withColumn("rede_nome", mapear_rede(F.col("rede")))
                .withColumn("ts_processamento", F.current_timestamp())
                .withColumn("latencia_ms",
                            F.round((F.unix_timestamp("ts_processamento")
@@ -313,7 +328,7 @@ QUEDA_ALERTA_PP = 10.0
 stream = spark.table(TABELA_STREAM)
 
 janelas = (stream
-           .groupBy(F.window(F.to_timestamp("ts_evento"), "10 seconds"), "sigla_uf")
+           .groupBy(F.window(F.expr("try_to_timestamp(ts_evento)"), "10 seconds"), "sigla_uf")
            .agg(F.count("*").alias("eventos"),
                 F.round(F.sum(F.col("alfabetizado").cast("double") * F.col("peso_aluno"))
                         / F.sum("peso_aluno") * 100, 2).alias("taxa_pct"),
@@ -374,8 +389,10 @@ display(alertas)
 # ============================================================
 TABELA_SILVER_STREAM = f"{CATALOGO}.{SCHEMA_SILVER}.fato_avaliacao_stream"
 
+# Recriada a cada execucao para o teste de idempotencia partir sempre do mesmo estado.
+spark.sql(f"DROP TABLE IF EXISTS {TABELA_SILVER_STREAM}")
 spark.sql(f"""
-    CREATE TABLE IF NOT EXISTS {TABELA_SILVER_STREAM} (
+    CREATE TABLE {TABELA_SILVER_STREAM} (
         id_evento              STRING,
         id_aluno               STRING,
         id_municipio           INT,
@@ -384,6 +401,7 @@ spark.sql(f"""
         nome_regiao            STRING,
         id_escola              STRING,
         rede                   INT,
+        rede_nome              STRING,
         serie                  INT,
         proficiencia_portugues DOUBLE,
         peso_aluno             DOUBLE,
@@ -396,7 +414,8 @@ spark.sql(f"""
 
 spark.table(TABELA_STREAM).select(
     "id_evento", "id_aluno", "id_municipio", "nome_municipio", "sigla_uf", "nome_regiao",
-    "id_escola", "rede", "serie", "proficiencia_portugues", "peso_aluno", "alfabetizado",
+    "id_escola", "rede", "rede_nome", "serie", "proficiencia_portugues", "peso_aluno",
+    "alfabetizado",
     "latencia_ms", "data_evento", "ts_evento",
 ).createOrReplaceTempView("novos_eventos")
 
