@@ -165,27 +165,47 @@ resumo_bronze = []
 with monitor.etapa("ingestao_arquivos", camada="bronze") as etapa:
     etapa.entrada(len(ARQUIVOS) + 1)
 
+    # Os cinco arquivos de indicador e de metas sao CSV. Sao pequenos, entao a
+    # inferencia de schema nao pesa.
     for entidade, arquivo in ARQUIVOS.items():
         bruto = (spark.read
                  .option("header", "true")
                  .option("inferSchema", "true")
                  .csv(f"{VOLUME}/{arquivo}"))
         nome = gravar(com_linhagem(bruto, entidade, arquivo), SCHEMA_BRONZE, entidade)
-        resumo_bronze.append((entidade, spark.table(nome).count(),
+        resumo_bronze.append((entidade, "csv", spark.table(nome).count(),
                               len(bruto.columns), nome))
-        print(f"[BRONZE] {entidade:22s} {resumo_bronze[-1][1]:>9,} linhas"
+        print(f"[BRONZE] {entidade:22s} {'csv':8s} {resumo_bronze[-1][2]:>9,} linhas"
               .replace(",", "."))
 
-    # Microdados de aluno: ja vem em Parquet, entao entram sem inferencia de schema
+    # Os microdados de aluno vem em Parquet. Sao 3,87 milhoes de linhas, e o
+    # Parquet ja traz o schema, entao entram sem inferencia.
     alunos_bruto = spark.read.parquet(f"{VOLUME}/{ARQUIVO_ALUNOS}")
-    nome = gravar(com_linhagem(alunos_bruto, "aluno", ARQUIVO_ALUNOS), SCHEMA_BRONZE, "aluno")
-    resumo_bronze.append(("aluno", spark.table(nome).count(),
+    nome = gravar(com_linhagem(alunos_bruto, "aluno", ARQUIVO_ALUNOS)
+                  .withColumn("_source_format", F.lit("parquet")), SCHEMA_BRONZE, "aluno")
+    resumo_bronze.append(("aluno", "parquet", spark.table(nome).count(),
                           len(alunos_bruto.columns), nome))
-    print(f"[BRONZE] {'aluno':22s} {resumo_bronze[-1][1]:>9,} linhas".replace(",", "."))
+    print(f"[BRONZE] {'aluno':22s} {'parquet':8s} {resumo_bronze[-1][2]:>9,} linhas"
+          .replace(",", "."))
 
-    etapa.saida(sum(linhas for _, linhas, _, _ in resumo_bronze))
+    etapa.saida(sum(linhas for _, _, linhas, _, _ in resumo_bronze))
 
-display(spark.createDataFrame(resumo_bronze, ["entidade", "linhas", "colunas", "tabela"]))
+display(spark.createDataFrame(
+    resumo_bronze, ["entidade", "formato", "linhas", "colunas", "tabela"]))
+
+# Peso de cada formato no que entra em lote. O arquivo de aluno sozinho responde
+# por quase todo o volume, entao a ingestao em lote e majoritariamente Parquet,
+# mesmo tendo mais arquivos CSV do que Parquet.
+por_formato = {}
+for _, formato, linhas, _, _ in resumo_bronze:
+    por_formato[formato] = por_formato.get(formato, 0) + linhas
+total_lote = sum(por_formato.values())
+
+print()
+print("Volume por formato de origem:")
+for formato, linhas in sorted(por_formato.items(), key=lambda x: -x[1]):
+    print(f"  {formato:8s} {linhas:>9,} linhas  {linhas / total_lote * 100:5.1f}%"
+          .replace(",", "."))
 
 # COMMAND ----------
 
