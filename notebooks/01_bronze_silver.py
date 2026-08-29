@@ -662,7 +662,8 @@ if n_divergentes:
 # RESUMO DA SILVER
 # ============================================================
 with monitor.etapa("resumo_silver", camada="silver") as etapa:
-    tabelas = spark.sql(f"SHOW TABLES IN {CATALOGO}.{SCHEMA_SILVER}").collect()
+    tabelas = [t for t in spark.sql(f"SHOW TABLES IN {CATALOGO}.{SCHEMA_SILVER}").collect()
+               if not t.isTemporary]
     linhas = [(t.tableName, spark.table(f"{CATALOGO}.{SCHEMA_SILVER}.{t.tableName}").count())
               for t in tabelas]
     etapa.saida(sum(n for _, n in linhas)).nota(f"{len(linhas)} tabelas na Silver")

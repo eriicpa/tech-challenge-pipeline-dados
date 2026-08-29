@@ -488,7 +488,11 @@ print("E a maior decisao de FinOps do projeto, e ela e arquitetural, nao de conf
 # ============================================================
 linhas = []
 for schema in (SCHEMA_BRONZE, SCHEMA_SILVER, SCHEMA_GOLD):
+    # O isTemporary tira as views de sessao criadas la em cima. Elas aparecem no
+    # SHOW TABLES de qualquer schema, mas nao pertencem a nenhum.
     for t in spark.sql(f"SHOW TABLES IN {CATALOGO}.{schema}").collect():
+        if t.isTemporary:
+            continue
         nome = f"{CATALOGO}.{schema}.{t.tableName}"
         linhas.append((schema, t.tableName, spark.table(nome).count()))
 
