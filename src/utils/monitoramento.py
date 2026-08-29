@@ -129,20 +129,23 @@ class Monitor:
             return
 
         duracao = sum(e[5] for e in self.execucoes)
-        entrada = sum(e[6] or 0 for e in self.execucoes)
         saida = sum(e[7] or 0 for e in self.execucoes)
-        rejeitadas = sum(e[8] or 0 for e in self.execucoes)
         falhas = [e for e in self.execucoes if e[9] == "FALHA"]
+
+        # So entram as etapas que declararam entrada e rejeitadas. Somar todas
+        # misturaria arquivos lidos com linhas processadas.
+        com_rejeicao = [e for e in self.execucoes if e[8] is not None and e[6]]
+        entrada_r = sum(e[6] for e in com_rejeicao)
+        rejeitadas = sum(e[8] for e in com_rejeicao)
 
         print(f"EXECUCAO {self.run_id}  |  {self.pipeline}")
         print(f"  etapas             : {len(self.execucoes)}"
               f" ({len(falhas)} com falha)")
         print(f"  duracao total      : {duracao:.1f}s")
-        print(f"  linhas de entrada  : {entrada:,}".replace(",", "."))
-        print(f"  linhas de saida    : {saida:,}".replace(",", "."))
-        if entrada:
-            print(f"  rejeitadas         : {rejeitadas:,}"
-                  f" ({rejeitadas / entrada * 100:.2f}%)".replace(",", "."))
+        print(f"  linhas gravadas    : {saida:,}".replace(",", "."))
+        if entrada_r:
+            print(f"  rejeitadas         : {rejeitadas:,} de {entrada_r:,}"
+                  f" ({rejeitadas / entrada_r * 100:.2f}%)".replace(",", "."))
         print(f"  alertas            : {len(self.alertas)}")
         print()
         print(f"  {'etapa':32s} {'camada':9s} {'seg':>7s} {'entrada':>12s} {'saida':>12s}  status")

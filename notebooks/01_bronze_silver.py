@@ -102,8 +102,6 @@ ARQUIVOS = {
     "meta_brasil":         "br_inep_avaliacao_alfabetizacao_meta_alfabetizacao_brasil.csv",
     "meta_uf":             "br_inep_avaliacao_alfabetizacao_meta_alfabetizacao_uf.csv",
     "meta_municipio":      "br_inep_avaliacao_alfabetizacao_meta_alfabetizacao_municipio.csv",
-    "dim_uf_ibge":         "ibge_estados.csv",
-    "dim_municipio_ibge":  "ibge_municipios.csv",
 }
 
 # Microdados de aluno: 3,87 milhões de linhas, em Parquet
@@ -127,6 +125,13 @@ display(dbutils.fs.ls(VOLUME))
 
 # MAGIC %md
 # MAGIC ## Camada Bronze
+# MAGIC
+# MAGIC Três formatos de origem entram em lote: os cinco arquivos de indicador e de metas são CSV,
+# MAGIC os microdados de aluno vêm em Parquet e o território vem em JSON, pela API do IBGE.
+# MAGIC
+# MAGIC Em número de arquivos o CSV é a maioria, mas em volume não. O Parquet dos microdados tem
+# MAGIC 3,87 milhões de linhas contra 35 mil de todos os CSVs somados, então quase tudo que entra
+# MAGIC em lote está em Parquet. A célula abaixo imprime essa divisão.
 # MAGIC
 # MAGIC Aqui o dado entra como veio, sem dropna e sem rename. As únicas colunas acrescentadas
 # MAGIC começam com underline e servem para saber depois de onde cada linha veio: quando foi
@@ -160,27 +165,121 @@ resumo_bronze = []
 with monitor.etapa("ingestao_arquivos", camada="bronze") as etapa:
     etapa.entrada(len(ARQUIVOS) + 1)
 
+    # Os cinco arquivos de indicador e de metas sao CSV. Sao pequenos, entao a
+    # inferencia de schema nao pesa.
     for entidade, arquivo in ARQUIVOS.items():
         bruto = (spark.read
                  .option("header", "true")
                  .option("inferSchema", "true")
                  .csv(f"{VOLUME}/{arquivo}"))
         nome = gravar(com_linhagem(bruto, entidade, arquivo), SCHEMA_BRONZE, entidade)
-        resumo_bronze.append((entidade, spark.table(nome).count(),
+        resumo_bronze.append((entidade, "csv", spark.table(nome).count(),
                               len(bruto.columns), nome))
-        print(f"[BRONZE] {entidade:22s} {resumo_bronze[-1][1]:>9,} linhas"
+        print(f"[BRONZE] {entidade:22s} {'csv':8s} {resumo_bronze[-1][2]:>9,} linhas"
               .replace(",", "."))
 
-    # Microdados de aluno: ja vem em Parquet, entao entram sem inferencia de schema
+    # Os microdados de aluno vem em Parquet. Sao 3,87 milhoes de linhas, e o
+    # Parquet ja traz o schema, entao entram sem inferencia.
     alunos_bruto = spark.read.parquet(f"{VOLUME}/{ARQUIVO_ALUNOS}")
-    nome = gravar(com_linhagem(alunos_bruto, "aluno", ARQUIVO_ALUNOS), SCHEMA_BRONZE, "aluno")
-    resumo_bronze.append(("aluno", spark.table(nome).count(),
+    nome = gravar(com_linhagem(alunos_bruto, "aluno", ARQUIVO_ALUNOS)
+                  .withColumn("_source_format", F.lit("parquet")), SCHEMA_BRONZE, "aluno")
+    resumo_bronze.append(("aluno", "parquet", spark.table(nome).count(),
                           len(alunos_bruto.columns), nome))
-    print(f"[BRONZE] {'aluno':22s} {resumo_bronze[-1][1]:>9,} linhas".replace(",", "."))
+    print(f"[BRONZE] {'aluno':22s} {'parquet':8s} {resumo_bronze[-1][2]:>9,} linhas"
+          .replace(",", "."))
 
-    etapa.saida(sum(linhas for _, linhas, _, _ in resumo_bronze))
+    etapa.saida(sum(linhas for _, _, linhas, _, _ in resumo_bronze))
 
-display(spark.createDataFrame(resumo_bronze, ["entidade", "linhas", "colunas", "tabela"]))
+display(spark.createDataFrame(
+    resumo_bronze, ["entidade", "formato", "linhas", "colunas", "tabela"]))
+
+# Peso de cada formato no que entra em lote. O arquivo de aluno sozinho responde
+# por quase todo o volume, entao a ingestao em lote e majoritariamente Parquet,
+# mesmo tendo mais arquivos CSV do que Parquet.
+por_formato = {}
+for _, formato, linhas, _, _ in resumo_bronze:
+    por_formato[formato] = por_formato.get(formato, 0) + linhas
+total_lote = sum(por_formato.values())
+
+print()
+print("Volume por formato de origem:")
+for formato, linhas in sorted(por_formato.items(), key=lambda x: -x[1]):
+    print(f"  {formato:8s} {linhas:>9,} linhas  {linhas / total_lote * 100:5.1f}%"
+          .replace(",", "."))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Território pela API do IBGE
+# MAGIC
+# MAGIC As tabelas do Inep só trazem o código IBGE de sete dígitos. Sem nome de município, UF e
+# MAGIC região não dá para fazer nenhum recorte territorial, então foi preciso buscar isso fora.
+# MAGIC
+# MAGIC A fonte é a API pública de Localidades do IBGE. É a integração com fonte externa que o
+# MAGIC desafio sugere, e a única origem que não vem do Inep.
+# MAGIC
+# MAGIC O serverless do Databricks tem restrição de saída para internet, então a chamada pode não
+# MAGIC completar. Se isso acontecer, a célula usa o CSV que está no volume, que é o mesmo payload
+# MAGIC baixado antes, e grava um alerta dizendo qual origem foi usada. A coluna _source_format
+# MAGIC registra se veio da API ou do arquivo.
+
+# COMMAND ----------
+
+# ============================================================
+# INGESTÃO DO IBGE: API COM QUEDA PARA O ARQUIVO
+# ============================================================
+import pandas as pd
+
+API_IBGE = "https://servicodados.ibge.gov.br/api/v1/localidades"
+IBGE = {
+    "dim_uf_ibge":        (f"{API_IBGE}/estados",    "ibge_estados.csv",    27),
+    "dim_municipio_ibge": (f"{API_IBGE}/municipios", "ibge_municipios.csv", 5500),
+}
+
+
+def buscar_na_api(url, tentativas=3, espera=2):
+    """Chama a API e devolve o JSON achatado, ou None se a rede nao permitir."""
+    import time
+
+    import requests
+
+    for tentativa in range(1, tentativas + 1):
+        try:
+            resposta = requests.get(url, timeout=20)
+            resposta.raise_for_status()
+            return pd.json_normalize(resposta.json(), sep="_")
+        except Exception as erro:
+            if tentativa == tentativas:
+                print(f"  API indisponivel apos {tentativas} tentativas: "
+                      f"{type(erro).__name__}: {erro}")
+                return None
+            time.sleep(espera * tentativa)   # espera crescente entre tentativas
+
+
+with monitor.etapa("ingestao_ibge", camada="bronze") as etapa:
+    origens, total_territorios = [], 0
+    for entidade, (url, arquivo, minimo) in IBGE.items():
+        achatado = buscar_na_api(url)
+
+        if achatado is not None and len(achatado) >= minimo:
+            df = spark.createDataFrame(achatado.astype(str))
+            origem, formato = url, "json_api"
+        else:
+            df = (spark.read.option("header", "true").option("inferSchema", "true")
+                  .csv(f"{VOLUME}/{arquivo}"))
+            origem, formato = arquivo, "csv"
+            monitor.alerta("BAIXA", f"{entidade} veio do volume: API do IBGE inacessivel")
+
+        nome = gravar(com_linhagem(df, entidade, origem).withColumn(
+            "_source_format", F.lit(formato)), SCHEMA_BRONZE, entidade)
+        linhas = spark.table(nome).count()
+        total_territorios += linhas
+        origens.append((entidade, formato, linhas, origem))
+        print(f"[BRONZE] {entidade:22s} {linhas:>9,} linhas  via {formato}".replace(",", "."))
+
+    etapa.saida(total_territorios)
+
+display(spark.createDataFrame(origens, ["entidade", "origem", "linhas", "endereco"]))
 
 # COMMAND ----------
 
