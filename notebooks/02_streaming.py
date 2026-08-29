@@ -57,7 +57,23 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOGO}.{SCHEMA_MONITORAMENTO}")
 PONTO_CORTE_SAEB = 743
 
 
+def localizar_raiz_repositorio():
+    """Acha a raiz do repositorio a partir do diretorio de execucao."""
+    inicio = Path(os.getcwd()).resolve()
+    for candidato in [inicio, *inicio.parents]:
+        if (candidato / "src" / "utils" / "monitoramento.py").exists():
+            return candidato
+    return None
 
+
+RAIZ = localizar_raiz_repositorio()
+if RAIZ is None:
+    raise Exception("Nao encontrei src/. Rode a partir do repositorio importado como Git folder.")
+sys.path.insert(0, str(RAIZ))
+
+from src.utils.monitoramento import Monitor
+
+monitor = Monitor(spark, CATALOGO, SCHEMA_MONITORAMENTO, "02_streaming")
 
 DIM_REDE = {0: "Total", 1: "Federal", 2: "Estadual", 3: "Municipal", 4: "Privada", 5: "Publica"}
 
