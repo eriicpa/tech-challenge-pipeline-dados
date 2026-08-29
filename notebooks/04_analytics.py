@@ -29,6 +29,7 @@
 import os
 import sys
 import warnings
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -85,8 +86,18 @@ def salvar_figura(nome):
 
 
 def carregar(tabela):
-    """Carrega uma tabela da Gold como DataFrame do pandas."""
-    return spark.table(f"{CATALOGO}.{SCHEMA_GOLD}.{tabela}").toPandas()
+    """Carrega uma tabela da Gold como DataFrame do pandas.
+
+    Expressao com literal decimal no SQL, do tipo 100.0 * SUM(...), produz DECIMAL
+    no Spark, e o toPandas devolve isso como objeto Decimal em coluna do tipo
+    object. Nesse formato o matplotlib nao plota e o sklearn nao treina, entao as
+    colunas numericas viram float na carga.
+    """
+    df = spark.table(f"{CATALOGO}.{SCHEMA_GOLD}.{tabela}").toPandas()
+    for coluna, tipo in zip(df.columns, df.dtypes):
+        if tipo == "object" and isinstance(df[coluna].dropna().head(1).squeeze(), Decimal):
+            df[coluna] = df[coluna].astype(float)
+    return df
 
 
 with monitor.etapa("carga_gold", camada="gold") as etapa:
@@ -190,9 +201,19 @@ display(resumo_regiao)
 # ============================================================
 # ETAPA 2.2 — META × REALIZADO POR UF E EVOLUÇÃO ENTRE CICLOS
 # ============================================================
-painel_uf = (consolidado[(consolidado["ano"] == ANO_REFERENCIA)
-                         & (consolidado["rede_nome"] == REDE_FOCO)]
+# UF sem nenhum municipio com meta definida fica com percentual nulo, por causa
+# do NULLIF na consulta. Sai do grafico e e listada a parte, senao apareceria
+# como barra zerada.
+painel_completo = consolidado[(consolidado["ano"] == ANO_REFERENCIA)
+                              & (consolidado["rede_nome"] == REDE_FOCO)]
+sem_meta = painel_completo[painel_completo["pct_municipios_na_meta"].isna()]
+painel_uf = (painel_completo.dropna(subset=["pct_municipios_na_meta"])
              .sort_values("pct_municipios_na_meta", ascending=False))
+
+if len(sem_meta):
+    print(f"{len(sem_meta)} UF(s) sem meta municipal definida, fora do grafico: "
+          f"{', '.join(sorted(sem_meta['sigla_uf']))}")
+    print()
 
 fig, eixos = plt.subplots(1, 2, figsize=(15, 6))
 
