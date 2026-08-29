@@ -225,7 +225,7 @@ def processar_lote(lote, epoca):
     marcado = (lote
                .withColumn("ts_convertido", F.to_timestamp("ts_evento"))
                .join(F.broadcast(dim_municipio), on="id_municipio", how="left"))
-    marcado = marcado.withColumn("motivo_rejeicao", motivo_rejeicao(marcado)).cache()
+    marcado = marcado.withColumn("motivo_rejeicao", motivo_rejeicao(marcado))
 
     invalidos = marcado.filter(F.col("motivo_rejeicao").isNotNull())
     if invalidos.head(1):
@@ -249,8 +249,6 @@ def processar_lote(lote, epoca):
                .drop("motivo_rejeicao", "_defeito_injetado"))
     if validos.head(1):
         (validos.write.mode("append").option("mergeSchema", "true").saveAsTable(TABELA_STREAM))
-
-    marcado.unpersist()
 
 
 
